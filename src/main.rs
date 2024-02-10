@@ -2,7 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind, Read};
 use std::{env, usize};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+macro_rules! unwrap_or_return_with_message {
+    ( $e:expr, $text:tt) => {
+        match $e {
+            Ok(value) => value,
+            Err(err) => return exit_with_error(format!("{}. Err: {}", $text, err)),
+        }
+    };
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 struct Todo {
     title: String,
     completed: bool,
@@ -18,6 +27,11 @@ impl Todo {
 }
 
 type Todos = Vec<Todo>;
+
+fn exit_with_error(err_message: String) {
+    println!("{err_message}");
+    std::process::exit(0);
+}
 
 fn get_todos() -> Result<Todos, Error> {
     let mut file = std::fs::OpenOptions::new()
@@ -41,7 +55,7 @@ fn save_todo_list(todo_list: Todos) -> Result<(), Error> {
     Ok(())
 }
 
-fn create_new_todo(title: &str) -> Result<(), Error> {
+fn create_new_todo(title: &str) -> Result<Todo, Error> {
     let todo = Todo::new(title.to_string());
     let mut todo_list = get_todos().unwrap_or(Vec::new());
     if todo_list.contains(&todo) {
@@ -50,23 +64,34 @@ fn create_new_todo(title: &str) -> Result<(), Error> {
             "Todo already exists on the todo list",
         ));
     }
-    todo_list.push(todo);
+    todo_list.push(todo.clone());
     save_todo_list(todo_list)?;
-    println!("Sucessfully created a new todo: {title}");
-    Ok(())
+    Ok(todo)
 }
 
-fn set_todo_state(index: usize, state: bool) -> Result<(), Error> {
+fn set_todo_state(index: usize, state: bool) -> Result<Todo, Error> {
     let mut todo_list = get_todos().unwrap_or(Vec::new());
     if todo_list.is_empty() {
         return Err(Error::new(ErrorKind::Other, "The todo list is empty"));
     }
-    todo_list[index].completed = state;
-    save_todo_list(todo_list)?;
-    Ok(())
+    if let Some(todo) = todo_list.get_mut(index) {
+        *todo = Todo { completed: state, ..todo.clone() };
+        let todo_clone = todo.clone();
+        if let Err(err) = save_todo_list(todo_list) {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("Failed at saving the todo list. Err: {err}"),
+            ));
+        };
+        return Ok(todo_clone)
+    }
+    return Err(Error::new(
+        ErrorKind::Other,
+        format!("Invalid index at: {index}"),
+    ));
 }
 
-fn delete_todo(index: usize) -> Result<(), Error> {
+fn delete_todo(index: usize) -> Result<Todo, Error> {
     let mut todo_list = get_todos()?;
     let todo = todo_list.get(index);
     let Some(todo) = todo else {
@@ -75,12 +100,25 @@ fn delete_todo(index: usize) -> Result<(), Error> {
             format!("Invalid todo at position {index}"),
         ));
     };
+    let mut option = String::new();
     if !todo.completed {
-        return Err(Error::new(ErrorKind::Other, "Todo is not yet completed"));
+        println!("The todo is noy yet completed, continue anyway? [Y/N]: ");
+        if let Err(_) = std::io::stdin().read_line(&mut option) {
+            println!("A error ocurred while reading the input, assuming N");
+        }
+        match option.trim().to_uppercase().as_str() {
+            "Y" | "YES" => (),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Todo is not yet completed",
+                ))
+            }
+        };
     }
-    todo_list.remove(index);
+    let todo = todo_list.remove(index);
     save_todo_list(todo_list)?;
-    Ok(())
+    Ok(todo)
 }
 
 fn list_todos() {
@@ -100,31 +138,35 @@ fn list_todos() {
 
 // TODOOO: Implement the help function
 fn show_help() {
-    println!("No help, No help for you >:[")
+    println!(
+       " l | list => list the todos\n \
+        n | new <TITLE> => create a new todo with the given title\n \
+        c | complete <ID> => mark the todo with the given id as completed\n \
+        u | uncomplete <ID> => mark the todo with the given id as uncompleted\n \
+        d | delete <ID> => delete the todo with the given id\n"
+    )
 }
 
-fn get_index_from_arg(args: &Vec<String>) -> usize {
+fn get_index_from_arg(args: &Vec<String>) -> Result<usize, Error> {
     if args.len() <= 1 {
-        println!("Error: No todo ID has been provided");
-        std::process::exit(0)
+        return Err(Error::new(
+            ErrorKind::Other,
+            "Error: No todo ID has been provided",
+        ));
     }
     let result = args[1].trim().parse::<usize>();
     if let Err(err) = result {
-        println!("A error ocurred while parsing argv 1. Err: {err}");
-        std::process::exit(0);
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("A error ocurred while parsing argv 1. Err: {err}"),
+        ));
     }
     let mut index: usize = result.unwrap();
 
     if index > 0 {
         index -= 1
     }
-
-    index
-}
-
-fn exit_with_error(err_message: String) {
-    println!("{err_message}");
-    std::process::exit(0);
+    Ok(index)
 }
 
 fn cli() {
@@ -145,31 +187,47 @@ fn cli() {
                 exit_with_error("Error: no title has been provided!".to_string());
             }
             let title: &str = &args[1];
-            if let Err(err) = create_new_todo(title) {
-                exit_with_error(format!(
-                    "A error ocurred during the creation of a todo: {err}"
-                ));
-            };
+            let todo = unwrap_or_return_with_message!(
+                create_new_todo(title),
+                (String::from("Failed to create a new todo"))
+            );
+            println!("Sucessfully created a new todo: {}", todo.title);
         }
         "complete" | "c" => {
-            let index: usize = get_index_from_arg(&args);
-            if let Err(err) = set_todo_state(index, true) {
-                exit_with_error(format!(
-                    "A error ocurred while setting the state of the todo. Err: {err}"
-                ));
-            };
-            println!("yay :D");
+            let index: usize = unwrap_or_return_with_message!(
+                get_index_from_arg(&args),
+                (String::from("Failed to get the index from given arguments"))
+            );
+            let todo = unwrap_or_return_with_message!(
+                set_todo_state(index, true),
+                (String::from("Failed to create a new todo"))
+            );
+            println!("Sucessfully set the todo {} as completed", todo.title);
+        }
+
+        "uncomplete" | "uc" => {
+            let index: usize = unwrap_or_return_with_message!(
+                get_index_from_arg(&args),
+                (String::from("Failed to get the index from given arguments"))
+            );
+            let todo = unwrap_or_return_with_message!(
+                set_todo_state(index, false),
+                (String::from("Failed to create a new todo"))
+            );
+            println!("Sucessfully set the todo {} as uncompleted", todo.title);
         }
         "delete" | "d" => {
-            let index: usize = get_index_from_arg(&args);
-            if let Err(err) = delete_todo(index) {
-                exit_with_error(format!(
-                    "A error ocurred while deleting the todo. Err: {err}"
-                ));
-            }
-            println!("yay :D");
+            let index: usize = unwrap_or_return_with_message!(
+                get_index_from_arg(&args),
+                (String::from("Failed to get the index from given arguments"))
+            );
+            let todo = unwrap_or_return_with_message!(
+                delete_todo(index),
+                (format!("Failed to delete the todo at index {index}"))
+            );
+            println!("Sucessfully deleted the todo: {}", todo.title);
         }
-        _ => show_help(),
+        "h" | "help" | _ => show_help(),
     }
 }
 
